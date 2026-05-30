@@ -1,0 +1,7 @@
+shioaji
+pandas
+matplotlib
+psycopg2-binary
+sqlalchemy
+python-telegram-bot
+apscheduler
