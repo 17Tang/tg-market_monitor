@@ -1,6 +1,7 @@
 import os
 import datetime
 import logging
+import pytz  # 新增的時區套件
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -14,7 +15,6 @@ import matplotlib.dates as mdates
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # ==================== 雲端環境變數設定 (安全版) ====================
-# os.getenv() 只帶入變數名稱，它會自動去 Render 後台抓取對應的值
 API_KEY = os.getenv("SHIOAJI_API_KEY")
 SECRET_KEY = os.getenv("SHIOAJI_SECRET_KEY")
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -28,14 +28,19 @@ else:
 
 IMAGE_PATH = "realtime_trend.png"
 engine = create_engine(DB_URL)
+
+# 強制設定台北時區
+TW_TZ = pytz.timezone('Asia/Taipei')
 # ==================================================================
 
 def fetch_and_save_to_db():
     """ 盤中每 5 分鐘執行的任務：從永豐金抓取並塞入資料庫 """
-    now = datetime.datetime.now()
+    # 關鍵修正：改用台北時間，不使用伺服器預設的 UTC 時間
+    now = datetime.datetime.now(TW_TZ)
     
     # 檢查是否為台股開盤時間 (週一至週五 09:00 - 13:35)
     if now.weekday() >= 5 or not ("09:00" <= now.strftime("%H:%M") <= "13:35"):
+        logging.info(f"非台股開盤時間 ({now.strftime('%H:%M')})，跳過抓取。")
         return
 
     logging.info("⏰ 觸發定時任務：開始抓取盤中數據...")
@@ -53,22 +58,23 @@ def fetch_and_save_to_db():
         }
         df = pd.DataFrame(new_data)
         
-        # 寫入 PostgreSQL 資料庫，若資料表不存在會自動建立，存在則自動附加(append)
+        # 寫入 PostgreSQL 資料庫
         df.to_sql("market_status", engine, if_exists="append", index=False)
         logging.info("💾 數據已成功寫入雲端資料庫")
         api.logout()
     except Exception as e:
-        logging.error(f"❌ 抓取或寫入資料庫失敗: {e}")
+        logging.error(f"❌ 抓取或寫入資料庫失敗，高機率是海外 IP 被券商擋住。錯誤: {e}")
 
 def draw_chart_from_db():
-    """ 從資料庫讀取今日數據並畫圖 """
+    """ 从资料库读取今日数据并画图 """
     try:
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
-        # SQL 語法：只撈取今天的數據
+        # 關鍵修正：撈取台北日期的當天資料
+        today_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
         query = f"SELECT * FROM market_status WHERE timestamp LIKE '{today_str}%' ORDER BY timestamp ASC"
         df = pd.read_sql(query, engine)
         
         if df.empty:
+            logging.warning(f"資料庫裡找不到當天 ({today_str}) 的數據")
             return False
             
         df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -109,7 +115,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     latest_row = draw_chart_from_db()
     if latest_row is False:
-        await update.message.reply_text("❌ 資料庫中目前還沒有今天的數據喔！")
+        await update.message.reply_text("❌ 資料庫中目前還沒有今天的數據喔！(可能前幾小時的自動排程因時區或海外IP未成功寫入)")
     elif latest_row is None:
         await update.message.reply_text("❌ 讀取資料庫或繪圖時發生非預期錯誤。")
     else:
