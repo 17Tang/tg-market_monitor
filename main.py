@@ -50,11 +50,11 @@ def fetch_and_save_to_db():
 
     logging.info("⏰ 觸發定時任務：開始抓取盤中數據...")
     try:
-        api = sj.Shioaji()
-        # simulation=True 開啟模擬環境連線，避開正式環境 Production 權限限制
-        api.login(api_key=API_KEY, secret_key=SECRET_KEY, simulation=True)
+        # 修改成這樣
+        api = sj.Shioaji(simulation=True)
+        api.login(api_key=API_KEY, secret_key=SECRET_KEY)
         
-        # 抓取上市櫃大盤快照 (001 為上市大盤，101 為上櫃大盤)
+        # 抓取上市櫃大盤快照
         snapshots = api.snapshots([api.Contracts.Stocks["001"], api.Contracts.Stocks["101"]])
         
         new_data = {
@@ -144,8 +144,8 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("🔍 正在即時連線永豐金（模擬環境）抓取原始大盤快照...")
     
     try:
-        api = sj.Shioaji()
-        api.login(api_key=API_KEY, secret_key=SECRET_KEY, simulation=True)
+        api = sj.Shioaji(simulation=True)
+        api.login(api_key=API_KEY, secret_key=SECRET_KEY)
         
         tse_contract = api.Contracts.Stocks["001"]
         otc_contract = api.Contracts.Stocks["101"]
