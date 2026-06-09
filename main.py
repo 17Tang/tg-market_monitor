@@ -130,22 +130,22 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         
         loop = asyncio.get_running_loop()
         
-        # 建立一個安全捕獲內部繪圖錯誤的包裝
         def safe_draw():
             try:
                 return draw_chart_to_memory()
             except Exception as inner_err:
-                # 如果繪圖內部崩潰，把追蹤紀錄傳出來
-                return "ERR", traceback.format_exc()
+                # 如果繪圖內部崩潰，回傳一個特殊標記字串
+                return "ERR_CRASH", traceback.format_exc()
 
         result = await loop.run_in_executor(None, safe_draw)
         
-        # 處理內部崩潰偵錯
-        if isinstance(result, tuple) and result[0] == "ERR":
+        # 關鍵修正：先嚴格檢查 result 是不是我們自訂的崩潰字串組合，避免跟 Pandas Series 衝突
+        if isinstance(result, tuple) and len(result) == 2 and result[0] == "ERR_CRASH":
             error_details = result[1]
             await update.message.reply_text(f"❌ 繪圖核心組件崩潰！詳細錯誤追蹤如下：\n```text\n{error_details}\n```", parse_mode="Markdown")
             return
 
+        # 這裡才安全地解包成功數據
         latest_row, img_buf = result
         
         if latest_row is False:
@@ -153,6 +153,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         elif latest_row is None:
             await update.message.reply_text("❌ 讀取資料庫或繪圖時發生未知的非預期錯誤。")
         else:
+            # 成功繪圖，讀取時間戳記
             time_str = pd.to_datetime(latest_row['timestamp']).strftime('%H:%M')
             caption_text = (
                 f"📊 即時雲端監測 ({time_str})\n"
@@ -160,8 +161,8 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"🏢 上櫃家數差: {latest_row['otc_diff']:+d}"
             )
             await update.message.reply_photo(photo=img_buf, caption=caption_text)
+            
     except Exception as e:
-        # 外部呼叫錯誤捕獲
         ext_err = traceback.format_exc()
         logging.error(f"check 指令執行出錯: {e}")
         await update.message.reply_text(f"❌ 指令外部通訊失敗！錯誤訊息：\n```text\n{ext_err}\n```", parse_mode="Markdown")
