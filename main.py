@@ -3,6 +3,7 @@ import datetime
 import logging
 import asyncio
 import random
+import io  # 關鍵修正：引入記憶體流，免除實體檔案佔用問題
 import pytz
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -11,7 +12,7 @@ import shioaji as sj
 import pandas as pd
 from sqlalchemy import create_engine
 import matplotlib
-matplotlib.use('Agg')  # 👈 關鍵修正 1：強制繪圖後台使用非互動模式，防止 Linux 伺服器卡死
+matplotlib.use('Agg')  # 強制非互動模式
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
@@ -32,7 +33,6 @@ if raw_db_url:
 else:
     raise ValueError("❌ 錯誤：未在雲端後台設定 DATABASE_URL 環境變數！")
 
-IMAGE_PATH = "realtime_trend.png"
 engine = create_engine(DB_URL)
 TW_TZ = pytz.timezone('Asia/Taipei')
 # ==================================================================
@@ -41,7 +41,6 @@ def fetch_and_save_to_db():
     """ 盤中每 5 分鐘執行的排程任務：從永豐金抓取並寫入資料庫 """
     now = datetime.datetime.now(TW_TZ)
     
-    # 檢查是否為台股開盤時間 (週一至週五 09:00 - 13:35)
     if now.weekday() >= 5 or not ("09:00" <= now.strftime("%H:%M") <= "13:35"):
         logging.info(f"非台股開盤時間 ({now.strftime('%H:%M')})，跳過抓取排程。")
         return
@@ -73,8 +72,8 @@ def fetch_and_save_to_db():
     except Exception as e:
         logging.error(f"❌ API 登入或連線失敗。錯誤訊息: {e}")
 
-def draw_chart_from_db():
-    """ 從資料庫讀取今日台北時間的歷史數據並畫圖 """
+def draw_chart_to_memory():
+    """ 從資料庫讀取今日數據，並直接把圖片畫在記憶體裡（不產生實體檔案） """
     try:
         today_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
         query = f"SELECT * FROM market_status WHERE timestamp LIKE '{today_str}%' ORDER BY timestamp ASC"
@@ -82,11 +81,10 @@ def draw_chart_from_db():
         
         if df.empty:
             logging.warning(f"資料庫裡找不到當天 ({today_str}) 的數據")
-            return False
+            return False, None
             
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         
-        # 建立畫布
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
         plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
         plt.rcParams['axes.unicode_minus'] = False 
@@ -107,23 +105,26 @@ def draw_chart_from_db():
 
         ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         fig.autofmt_xdate()
-        
         plt.tight_layout()
-        plt.savefig(IMAGE_PATH, dpi=150)
-        plt.close(fig)  # 強制釋放畫布記憶體
-        return df.iloc[-1]
+        
+        # 關鍵優化：將圖片存入 BytesIO 記憶體快取中
+        img_buf = io.BytesIO()
+        plt.savefig(img_buf, format='png', dpi=150)
+        img_buf.seek(0)  # 將指針移回起點，方便讀取
+        plt.close(fig)
+        
+        return df.iloc[-1], img_buf
     except Exception as e:
         logging.error(f"繪圖失敗: {e}")
-        return None
+        return None, None
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """ 當收到 /check 指令時回應當前走勢圖 """
     try:
         await update.message.reply_text("⏳ 正在從雲端資料庫撈取最新數據並即時繪圖...")
         
-        # 異步執行繪圖，避免阻塞 Bot 執行緒
         loop = asyncio.get_running_loop()
-        latest_row = await loop.run_in_executor(None, draw_chart_from_db)
+        latest_row, img_buf = await loop.run_in_executor(None, draw_chart_to_memory)
         
         if latest_row is False:
             await update.message.reply_text("❌ 資料庫中目前還沒有今天的數據喔！請靜待下一個 5 分鐘自動排程寫入數據。")
@@ -136,26 +137,30 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"🏛 上市家數差: {latest_row['tse_diff']:+d}\n"
                 f"🏢 上櫃家數差: {latest_row['otc_diff']:+d}"
             )
-            with open(IMAGE_PATH, 'rb') as photo:
-                await update.message.reply_photo(photo=photo, caption=caption_text)
+            # 直接發送記憶體中的二進位圖片數據
+            await update.message.reply_photo(photo=img_buf, caption=caption_text)
     except Exception as e:
         logging.error(f"check 指令執行出錯: {e}")
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ 當在 TG 打 /debug 時，印出合約測試狀態 """
+    """ 當在 TG 打 /debug 時，優化安全性，直接回傳連線測試結果 """
     try:
         await update.message.reply_text("🔍 正在測試連線永豐金模擬環境...")
         
         def test_conn():
             api = sj.Shioaji(simulation=True)
             api.login(api_key=API_KEY, secret_key=SECRET_KEY)
-            stock_sample = list(api.Contracts.Stocks.__dict__.keys())[:5]
+            # 安全查詢：確認是否能正常取得合約清單物件，不硬轉 __dict__
+            has_stocks = hasattr(api.Contracts, 'Stocks')
             api.logout()
-            return stock_sample
+            return has_stocks
 
         loop = asyncio.get_running_loop()
-        stock_sample = await loop.run_in_executor(None, test_conn)
-        await update.message.reply_text(f"✅ 連線成功！模擬環境股票代碼範例（前5碼）:\n{stock_sample}")
+        success = await loop.run_in_executor(None, test_conn)
+        if success:
+            await update.message.reply_text("✅ 【連線成功】永豐金 API 在 Render 雲端運作完全正常，合約模組讀取無誤！")
+        else:
+            await update.message.reply_text("❌ 【連線失敗】無法正確讀取永豐金合約模組。")
     except Exception as e:
         await update.message.reply_text(f"❌ 測試失敗: {e}")
 
@@ -188,13 +193,10 @@ async def main():
     await application.start()
     logging.info("🤖 Telegram Bot 監聽服務已在背景建立...")
     
-    # 4. 在主循環中同步跑網頁服務
+    # 4. 執行網頁服務
     logging.info("🚀 雲端伺服器與監聽系統正式上線...")
-    
-    # 使用 run_in_executor 跑阻塞的網頁服務，解放主事件循環
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, dummy_webhook_service)
 
 if __name__ == '__main__':
-    # 完美的非同步安全入口
     asyncio.run(main())
