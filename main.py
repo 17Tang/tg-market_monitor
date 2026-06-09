@@ -2,13 +2,8 @@ import os
 import datetime
 import logging
 import asyncio
-import random
-import io
 import traceback
 import pytz
-import requests  
-import re        
-import threading  # 👈 引入傳統線程，確保網頁服務100%不卡死異步Bot
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -16,7 +11,7 @@ import shioaji as sj
 import pandas as pd
 from sqlalchemy import create_engine, text
 import matplotlib
-matplotlib.use('Agg')  
+matplotlib.use('Agg')  # 強制非互動模式，Linux 伺服器專用
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
@@ -43,45 +38,24 @@ IMAGE_PATH = "realtime_trend.png"
 # ==================================================================
 
 def fetch_and_save_to_db():
-    """ 盤中每 5 分鐘執行的排程任務 """
+    """ 盤中每 5 分鐘執行的排程任務：從永豐金正式環境抓取大盤快照 """
     now = datetime.datetime.now(TW_TZ)
+    
     if now.weekday() >= 5 or not ("09:00" <= now.strftime("%H:%M") <= "13:35"):
         logging.info(f"非台股開盤時間 ({now.strftime('%H:%M')})，跳過抓取排程。")
         return
 
     logging.info("⏰ 觸發定時任務：開始抓取盤中數據...")
-    tse_diff = None
-    otc_diff = None
-
     try:
-        api = sj.Shioaji(simulation=True)
+        # 關鍵修正：徹底移除 simulation=True，直接連線永豐金正式生產環境！
+        api = sj.Shioaji()
         api.login(api_key=API_KEY, secret_key=SECRET_KEY)
+        
+        # 正式環境百分之百支援 001(上市) 與 101(上櫃) 大盤合約
         snapshots = api.snapshots([api.Contracts.Stocks["001"], api.Contracts.Stocks["101"]])
         tse_diff = snapshots[0].up_count - snapshots[0].down_count
         otc_diff = snapshots[1].up_count - snapshots[1].down_count
-        logging.info("💾 成功透過 永豐金 API 取得數據")
-        api.logout()
-    except Exception as api_err:
-        logging.warning(f"⚠️ API 數據不可用 ({api_err})，啟動網頁爬蟲備援...")
-
-    if tse_diff is None or otc_diff is None:
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            yahoo_api = "https://tw.stock.yahoo.com/_api/v1/market/overview"
-            res = requests.get(yahoo_api, headers=headers, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                for item in data.get('list', []):
-                    if item.get('symbol') == 'TEX#':
-                        tse_diff = int(item.get('upCount', 0)) - int(item.get('downCount', 0))
-                    elif item.get('symbol') == 'OEX#':
-                        otc_diff = int(item.get('upCount', 0)) - int(item.get('downCount', 0))
-        except Exception as crawl_err:
-            logging.error(f"❌ 爬蟲失敗: {crawl_err}")
-            tse_diff = random.randint(150, 350)
-            otc_diff = random.randint(80, 200)
-
-    try:
+        
         new_data = {
             "timestamp": [now.strftime("%Y-%m-%d %H:%M")],
             "tse_diff": [tse_diff],
@@ -89,13 +63,15 @@ def fetch_and_save_to_db():
         }
         df = pd.DataFrame(new_data)
         df.to_sql("market_status", engine, if_exists="append", index=False)
-        logging.info(f"📊 數據成功歸檔 (TSE: {tse_diff:+d} | OTC: {otc_diff:+d})")
-    except Exception as db_err:
-        logging.error(f"❌ 資料庫寫入失敗: {db_err}")
+        logging.info(f"📊 【正式數據】寫入成功 (TSE: {tse_diff:+d} | OTC: {otc_diff:+d})")
+        api.logout()
+    except Exception as e:
+        logging.error(f"❌ 永豐金正式環境連線或抓取失敗。錯誤訊息: {e}")
 
 def draw_chart_to_memory():
-    """ 從資料庫讀取今日數據，並直接把圖片畫在記憶體裡 """
+    """ 從資料庫讀取今日數據，並直接把圖片畫在記憶體裡（原生 SQL 安全版） """
     today_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    
     query = text("SELECT timestamp, tse_diff, otc_diff FROM market_status WHERE timestamp LIKE :today ORDER BY timestamp ASC")
     
     with engine.connect() as conn:
@@ -108,18 +84,22 @@ def draw_chart_to_memory():
         
     df = pd.DataFrame(rows, columns=['timestamp', 'tse_diff', 'otc_diff'])
     df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    # 轉成純字典傳遞，避開 Pandas 歧義檢查
     latest_row_dict = df.iloc[-1].to_dict()
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
     plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
     plt.rcParams['axes.unicode_minus'] = False 
 
+    # 上市圖表
     tse_colors = ['red' if val >= 0 else 'green' for val in df['tse_diff']]
     ax1.bar(df['timestamp'], df['tse_diff'], color=tse_colors, width=0.003)
     ax1.set_title("TWSE Market Width (TSE Diff)", fontsize=14)
     ax1.axhline(0, color='gray', linewidth=0.8, linestyle='--')
     ax1.grid(True, alpha=0.3)
 
+    # 上櫃圖表
     otc_colors = ['red' if val >= 0 else 'green' for val in df['otc_diff']]
     ax2.bar(df['timestamp'], df['otc_diff'], color=otc_colors, width=0.003)
     ax2.set_title("TPEx Market Width (OTC Diff)", fontsize=14)
@@ -137,13 +117,26 @@ def draw_chart_to_memory():
     
     return latest_row_dict, img_buf
 
-# ==================== TELEGRAM 指令功能區 ====================
-
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ 當收到 /check 指令時回應當前走勢圖 """
     try:
         await update.message.reply_text("⏳ 正在從雲端資料庫撈取最新真實數據並即時繪圖...")
+        
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, draw_chart_to_memory)
+        
+        def safe_draw():
+            try:
+                return draw_chart_to_memory()
+            except Exception as inner_err:
+                return "ERR_CRASH", traceback.format_exc()
+
+        result = await loop.run_in_executor(None, safe_draw)
+        
+        if isinstance(result, tuple) and result[0] == "ERR_CRASH":
+            error_details = result[1]
+            await update.message.reply_text(f"❌ 繪圖核心組件崩潰！詳細錯誤追蹤如下：\n```text\n{error_details}\n```", parse_mode="Markdown")
+            return
+
         latest_data, img_buf = result
         
         if latest_data is None:
@@ -156,10 +149,13 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"🏢 上櫃家數差: {int(latest_data['otc_diff']):+d}"
             )
             await update.message.reply_photo(photo=img_buf, caption=caption_text)
+            
     except Exception as e:
-        await update.message.reply_text(f"❌ 指令執行出錯：{e}")
+        ext_err = traceback.format_exc()
+        await update.message.reply_text(f"❌ 指令執行失敗：\n```text\n{ext_err}\n```", parse_mode="Markdown")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ /history 指令：直接在 TG 查閱最新 10 筆數據進行核對 """
     try:
         query = text("SELECT timestamp, tse_diff, otc_diff FROM market_status ORDER BY timestamp DESC LIMIT 10")
         with engine.connect() as conn:
@@ -179,23 +175,20 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"❌ 讀取歷史數據失敗: {e}")
 
 async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ /clean 指令：刪除今天以前的所有舊歷史資料 """
     try:
         today_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
         query = text("DELETE FROM market_status WHERE timestamp NOT LIKE :today")
-        
         with engine.connect() as conn:
             with conn.begin():
                 result = conn.execute(query, {"today": f"{today_str}%"})
                 deleted_rows = result.rowcount
-                
-        await update.message.reply_text(f"🧹 清理資料庫成功！已成功清空今天以前的舊資料，共刪除 {deleted_rows} 筆歷史紀錄。")
+        await update.message.reply_text(f"🧹 清理成功！已成功清空今天以前的舊資料，共刪除 {deleted_rows} 筆歷史紀錄。")
     except Exception as e:
         await update.message.reply_text(f"❌ 資料庫清理失敗: {e}")
 
-async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("✅ 系統完全在線，數據核心與網路爬蟲備援皆運作正常！")
-
 def dummy_webhook_service():
+    """ 網頁服務核心，用來維持 Render 存活 """
     from http.server import BaseHTTPRequestHandler, HTTPServer
     class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -206,25 +199,29 @@ def dummy_webhook_service():
     server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
     server.serve_forever()
 
-if __name__ == '__main__':
+async def main():
     # 1. 啟動背景排程器
     scheduler = BackgroundScheduler()
     scheduler.add_job(fetch_and_save_to_db, 'cron', minute='*/5')
     scheduler.start()
     logging.info("⏰ 盤中定時排程器已啟動...")
     
-    # 2. 設定 Telegram Bot 指令
+    # 2. 設定 Telegram Bot
     application = Application.builder().token(TG_TOKEN).build()
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(CommandHandler("clean", clean_command))    
-    application.add_handler(CommandHandler("debug", debug_command))
+    application.add_handler(CommandHandler("clean", clean_command))
     
-    # 3. 【關鍵修正】使用獨立的背景執行緒跑網頁服務，徹底解放主執行緒，絕不干擾非同步循環！
-    web_thread = threading.Thread(target=dummy_webhook_service, daemon=True)
-    web_thread.start()
-    logging.info("🚀 網頁存活守護服務已在背景獨立線程啟動...")
+    # 3. 啟動 Telegram Bot 監聽
+    await application.initialize()
+    await application.updater.start_polling()
+    await application.start()
+    logging.info("🤖 Telegram Bot 監聽服務已在背景建立...")
     
-    # 4. 主執行緒全權交給 Telegram Bot 異步監聽運作，永不閃退！
-    logging.info("🚀 雲端真實數據監聽系統正式上線...")
-    application.run_polling()
+    # 4. 執行網頁服務
+    logging.info("🚀 雲端伺服器與監聽系統正式上線...")
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, dummy_webhook_service)
+
+if __name__ == '__main__':
+    asyncio.run(main())
