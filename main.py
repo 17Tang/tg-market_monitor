@@ -36,7 +36,7 @@ else:
 
 engine = create_engine(DB_URL)
 TW_TZ = pytz.timezone('Asia/Taipei')
-IMAGE_PATH = "realtime_trend.png"  # 備用路徑
+IMAGE_PATH = "realtime_trend.png"
 # ==================================================================
 
 def fetch_and_save_to_db():
@@ -78,7 +78,6 @@ def draw_chart_to_memory():
     """ 從資料庫讀取今日數據，並直接把圖片畫在記憶體裡（原生 SQL 安全版） """
     today_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
     
-    # 使用標準原生 SQL 語法查詢，徹底避開 pandas read_sql 的套件衝突 Bug
     query = text("SELECT timestamp, tse_diff, otc_diff FROM market_status WHERE timestamp LIKE :today ORDER BY timestamp ASC")
     
     with engine.connect() as conn:
@@ -87,11 +86,13 @@ def draw_chart_to_memory():
         
     if not rows:
         logging.warning(f"資料庫裡找不到當天 ({today_str}) 的數據")
-        return False, None
+        return None, None
         
-    # 手動建立 DataFrame 確保時區安全
     df = pd.DataFrame(rows, columns=['timestamp', 'tse_diff', 'otc_diff'])
     df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    # 關鍵修正 1：在回傳前，就把最後一行的 Series 轉成「純粹的 Python 字典」，徹底絕育 Pandas 歧義 Bug
+    latest_row_dict = df.iloc[-1].to_dict()
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
     plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
@@ -115,13 +116,12 @@ def draw_chart_to_memory():
     fig.autofmt_xdate()
     plt.tight_layout()
     
-    # 影像存入記憶體
     img_buf = io.BytesIO()
     plt.savefig(img_buf, format='png', dpi=150)
     img_buf.seek(0)
     plt.close(fig)
     
-    return df.iloc[-1], img_buf
+    return latest_row_dict, img_buf
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """ 當收到 /check 指令時回應當前走勢圖 """
@@ -138,24 +138,23 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         result = await loop.run_in_executor(None, safe_draw)
         
-        # 安全檢查特殊標記，防止與 Pandas Series 的真假值判斷發生衝突
-        if isinstance(result, tuple) and len(result) == 2 and result[0] == "ERR_CRASH":
+        # 關鍵修正 2：現在 result 只可能是字串或正常的 (dict, img_buf)，完全不會有 Series 歧義
+        if isinstance(result, tuple) and result[0] == "ERR_CRASH":
             error_details = result[1]
             await update.message.reply_text(f"❌ 繪圖核心組件崩潰！詳細錯誤追蹤如下：\n```text\n{error_details}\n```", parse_mode="Markdown")
             return
 
-        latest_row, img_buf = result
+        latest_data, img_buf = result
         
-        if latest_row is False:
+        if latest_data is None:
             await update.message.reply_text("❌ 資料庫中目前還沒有今天的數據喔！請靜待下一個 5 分鐘自動排程寫入數據。")
-        elif latest_row is None:
-            await update.message.reply_text("❌ 讀取資料庫或繪圖時發生未知的非預期錯誤。")
         else:
-            time_str = pd.to_datetime(latest_row['timestamp']).strftime('%H:%M')
+            # 從字典裡乾淨地把數值倒出來
+            time_str = pd.to_datetime(latest_data['timestamp']).strftime('%H:%M')
             caption_text = (
                 f"📊 即時雲端監測 ({time_str})\n"
-                f"🏛 上市家數差: {latest_row['tse_diff']:+d}\n"
-                f"🏢 上櫃家數差: {latest_row['otc_diff']:+d}"
+                f"🏛 上市家數差: {int(latest_data['tse_diff']):+d}\n"
+                f"🏢 上櫃家數差: {int(latest_data['otc_diff']):+d}"
             )
             await update.message.reply_photo(photo=img_buf, caption=caption_text)
             
@@ -186,7 +185,6 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ 測試失敗: {e}")
 
 def dummy_webhook_service():
-    """ 網頁服務核心，用來維持 Render 存活 """
     from http.server import BaseHTTPRequestHandler, HTTPServer
     class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -198,24 +196,20 @@ def dummy_webhook_service():
     server.serve_forever()
 
 async def main():
-    # 1. 啟動背景排程器
     scheduler = BackgroundScheduler()
     scheduler.add_job(fetch_and_save_to_db, 'cron', minute='*/5')
     scheduler.start()
     logging.info("⏰ 盤中定時排程器已啟動...")
     
-    # 2. 設定 Telegram Bot
     application = Application.builder().token(TG_TOKEN).build()
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("debug", debug_command))
     
-    # 3. 啟動 Telegram Bot 監聽
     await application.initialize()
     await application.updater.start_polling()
     await application.start()
     logging.info("🤖 Telegram Bot 監聽服務已在背景建立...")
     
-    # 4. 解放事件循環，執行網頁服務
     logging.info("🚀 雲端伺服器與監聽系統正式上線...")
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, dummy_webhook_service)
