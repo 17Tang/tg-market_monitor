@@ -8,6 +8,7 @@ import traceback
 import pytz
 import requests  
 import re        
+import threading  # 👈 引入傳統線程，確保網頁服務100%不卡死異步Bot
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -139,7 +140,6 @@ def draw_chart_to_memory():
 # ==================== TELEGRAM 指令功能區 ====================
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ /check 指令 """
     try:
         await update.message.reply_text("⏳ 正在從雲端資料庫撈取最新真實數據並即時繪圖...")
         loop = asyncio.get_running_loop()
@@ -160,7 +160,6 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ 指令執行出錯：{e}")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ 【新功能】/history 指令：直接在 TG 查閱最新 10 筆數據進行核對 """
     try:
         query = text("SELECT timestamp, tse_diff, otc_diff FROM market_status ORDER BY timestamp DESC LIMIT 10")
         with engine.connect() as conn:
@@ -180,10 +179,8 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"❌ 讀取歷史數據失敗: {e}")
 
 async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ 【新功能】/clean 指令：刪除今天以前的所有舊歷史資料 """
     try:
         today_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
-        # SQL 語法：刪除 timestamp 開頭不是今天日期的所有舊資料
         query = text("DELETE FROM market_status WHERE timestamp NOT LIKE :today")
         
         with engine.connect() as conn:
@@ -209,24 +206,25 @@ def dummy_webhook_service():
     server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
     server.serve_forever()
 
-async def main():
+if __name__ == '__main__':
+    # 1. 啟動背景排程器
     scheduler = BackgroundScheduler()
     scheduler.add_job(fetch_and_save_to_db, 'cron', minute='*/5')
     scheduler.start()
     logging.info("⏰ 盤中定時排程器已啟動...")
     
+    # 2. 設定 Telegram Bot 指令
     application = Application.builder().token(TG_TOKEN).build()
     application.add_handler(CommandHandler("check", check_command))
-    application.add_handler(CommandHandler("history", history_command)) # 註冊歷史指令
-    application.add_handler(CommandHandler("clean", clean_command))     # 註冊清理指令
+    application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("clean", clean_command))    
     application.add_handler(CommandHandler("debug", debug_command))
     
-    await application.initialize()
-    await application.updater.start_polling()
-    await application.start()
+    # 3. 【關鍵修正】使用獨立的背景執行緒跑網頁服務，徹底解放主執行緒，絕不干擾非同步循環！
+    web_thread = threading.Thread(target=dummy_webhook_service, daemon=True)
+    web_thread.start()
+    logging.info("🚀 網頁存活守護服務已在背景獨立線程啟動...")
     
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, dummy_webhook_service)
-
-if __name__ == '__main__':
-    asyncio.run(main())
+    # 4. 主執行緒全權交給 Telegram Bot 異步監聽運作，永不閃退！
+    logging.info("🚀 雲端真實數據監聽系統正式上線...")
+    application.run_polling()
