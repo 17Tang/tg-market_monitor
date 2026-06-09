@@ -3,7 +3,8 @@ import datetime
 import logging
 import asyncio
 import random
-import io  # 關鍵修正：引入記憶體流，免除實體檔案佔用問題
+import io
+import traceback  # 👈 引入追蹤模組，用來抓取詳細錯誤
 import pytz
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -73,50 +74,46 @@ def fetch_and_save_to_db():
         logging.error(f"❌ API 登入或連線失敗。錯誤訊息: {e}")
 
 def draw_chart_to_memory():
-    """ 從資料庫讀取今日數據，並直接把圖片畫在記憶體裡（不產生實體檔案） """
-    try:
-        today_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
-        query = f"SELECT * FROM market_status WHERE timestamp LIKE '{today_str}%' ORDER BY timestamp ASC"
-        df = pd.read_sql(query, engine)
+    """ 從資料庫讀取今日數據，並直接把圖片畫在記憶體裡 """
+    # 這裡如果不加 try-except，拋出異常會直接卡死上層，因此這裡單純交給上層捕獲錯誤
+    today_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    query = f"SELECT * FROM market_status WHERE timestamp LIKE '{today_str}%' ORDER BY timestamp ASC"
+    df = pd.read_sql(query, engine)
+    
+    if df.empty:
+        logging.warning(f"資料庫裡找不到當天 ({today_str}) 的數據")
+        return False, None
         
-        if df.empty:
-            logging.warning(f"資料庫裡找不到當天 ({today_str}) 的數據")
-            return False, None
-            
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-        plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
-        plt.rcParams['axes.unicode_minus'] = False 
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
+    plt.rcParams['axes.unicode_minus'] = False 
 
-        # 上市
-        tse_colors = ['red' if val >= 0 else 'green' for val in df['tse_diff']]
-        ax1.bar(df['timestamp'], df['tse_diff'], color=tse_colors, width=0.003)
-        ax1.set_title("TWSE Market Width (TSE Diff)", fontsize=14)
-        ax1.axhline(0, color='gray', linewidth=0.8, linestyle='--')
-        ax1.grid(True, alpha=0.3)
+    # 上市
+    tse_colors = ['red' if val >= 0 else 'green' for val in df['tse_diff']]
+    ax1.bar(df['timestamp'], df['tse_diff'], color=tse_colors, width=0.003)
+    ax1.set_title("TWSE Market Width (TSE Diff)", fontsize=14)
+    ax1.axhline(0, color='gray', linewidth=0.8, linestyle='--')
+    ax1.grid(True, alpha=0.3)
 
-        # 上櫃
-        otc_colors = ['red' if val >= 0 else 'green' for val in df['otc_diff']]
-        ax2.bar(df['timestamp'], df['otc_diff'], color=otc_colors, width=0.003)
-        ax2.set_title("TPEx Market Width (OTC Diff)", fontsize=14)
-        ax2.axhline(0, color='gray', linewidth=0.8, linestyle='--')
-        ax2.grid(True, alpha=0.3)
+    # 上櫃
+    otc_colors = ['red' if val >= 0 else 'green' for val in df['otc_diff']]
+    ax2.bar(df['timestamp'], df['otc_diff'], color=otc_colors, width=0.003)
+    ax2.set_title("TPEx Market Width (OTC Diff)", fontsize=14)
+    ax2.axhline(0, color='gray', linewidth=0.8, linestyle='--')
+    ax2.grid(True, alpha=0.3)
 
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        fig.autofmt_xdate()
-        plt.tight_layout()
-        
-        # 關鍵優化：將圖片存入 BytesIO 記憶體快取中
-        img_buf = io.BytesIO()
-        plt.savefig(img_buf, format='png', dpi=150)
-        img_buf.seek(0)  # 將指針移回起點，方便讀取
-        plt.close(fig)
-        
-        return df.iloc[-1], img_buf
-    except Exception as e:
-        logging.error(f"繪圖失敗: {e}")
-        return None, None
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    
+    img_buf = io.BytesIO()
+    plt.savefig(img_buf, format='png', dpi=150)
+    img_buf.seek(0)
+    plt.close(fig)
+    
+    return df.iloc[-1], img_buf
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """ 當收到 /check 指令時回應當前走勢圖 """
@@ -124,12 +121,29 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("⏳ 正在從雲端資料庫撈取最新數據並即時繪圖...")
         
         loop = asyncio.get_running_loop()
-        latest_row, img_buf = await loop.run_in_executor(None, draw_chart_to_memory)
+        
+        # 建立一個安全捕獲內部繪圖錯誤的包裝
+        def safe_draw():
+            try:
+                return draw_chart_to_memory()
+            except Exception as inner_err:
+                # 如果繪圖內部崩潰，把追蹤紀錄傳出來
+                return "ERR", traceback.format_exc()
+
+        result = await loop.run_in_executor(None, safe_draw)
+        
+        # 處理內部崩潰偵錯
+        if isinstance(result, tuple) and result[0] == "ERR":
+            error_details = result[1]
+            await update.message.reply_text(f"❌ 繪圖核心組件崩潰！詳細錯誤追蹤如下：\n```text\n{error_details}\n```", parse_mode="Markdown")
+            return
+
+        latest_row, img_buf = result
         
         if latest_row is False:
             await update.message.reply_text("❌ 資料庫中目前還沒有今天的數據喔！請靜待下一個 5 分鐘自動排程寫入數據。")
         elif latest_row is None:
-            await update.message.reply_text("❌ 讀取資料庫或繪圖時發生非預期錯誤。")
+            await update.message.reply_text("❌ 讀取資料庫或繪圖時發生未知的非預期錯誤。")
         else:
             time_str = pd.to_datetime(latest_row['timestamp']).strftime('%H:%M')
             caption_text = (
@@ -137,20 +151,21 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"🏛 上市家數差: {latest_row['tse_diff']:+d}\n"
                 f"🏢 上櫃家數差: {latest_row['otc_diff']:+d}"
             )
-            # 直接發送記憶體中的二進位圖片數據
             await update.message.reply_photo(photo=img_buf, caption=caption_text)
     except Exception as e:
+        # 外部呼叫錯誤捕獲
+        ext_err = traceback.format_exc()
         logging.error(f"check 指令執行出錯: {e}")
+        await update.message.reply_text(f"❌ 指令外部通訊失敗！錯誤訊息：\n```text\n{ext_err}\n```", parse_mode="Markdown")
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ 當在 TG 打 /debug 時，優化安全性，直接回傳連線測試結果 """
+    """ 當在 TG 打 /debug 時，回傳連線測試結果 """
     try:
         await update.message.reply_text("🔍 正在測試連線永豐金模擬環境...")
         
         def test_conn():
             api = sj.Shioaji(simulation=True)
             api.login(api_key=API_KEY, secret_key=SECRET_KEY)
-            # 安全查詢：確認是否能正常取得合約清單物件，不硬轉 __dict__
             has_stocks = hasattr(api.Contracts, 'Stocks')
             api.logout()
             return has_stocks
@@ -176,24 +191,20 @@ def dummy_webhook_service():
     server.serve_forever()
 
 async def main():
-    # 1. 啟動背景排程器
     scheduler = BackgroundScheduler()
     scheduler.add_job(fetch_and_save_to_db, 'cron', minute='*/5')
     scheduler.start()
     logging.info("⏰ 盤中定時排程器已啟動...")
     
-    # 2. 設定 Telegram Bot
     application = Application.builder().token(TG_TOKEN).build()
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("debug", debug_command))
     
-    # 3. 啟動 Telegram Bot 監聽
     await application.initialize()
     await application.updater.start_polling()
     await application.start()
     logging.info("🤖 Telegram Bot 監聽服務已在背景建立...")
     
-    # 4. 執行網頁服務
     logging.info("🚀 雲端伺服器與監聽系統正式上線...")
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, dummy_webhook_service)
