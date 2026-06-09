@@ -200,23 +200,33 @@ def dummy_webhook_service():
     server.serve_forever()
 
 
+async def start_bot_async(application):
+    """ 負責在正確的異步循環中啟動 Telegram Bot """
+    await application.initialize()
+    await application.updater.start_polling()
+    await application.start()
+    logging.info("🤖 Telegram Bot 監聽服務已在背景建立...")
+
 if __name__ == '__main__':
     # 1. 啟動背景排程器（每 5 分鐘執行一次資料採集任務）
     scheduler = BackgroundScheduler()
     scheduler.add_job(fetch_and_save_to_db, 'cron', minute='*/5')
     scheduler.start()
+    logging.info("⏰ 盤中定時排程器已啟動...")
     
     # 2. 設定 Telegram Bot 指令處理器
     application = Application.builder().token(TG_TOKEN).build()
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("debug", debug_command))
     
-    # 3. 在事件循環中正確異步執行 Telegram Bot 監聽
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(application.initialize())
-    loop.run_until_complete(application.updater.start_polling())
-    loop.create_task(application.start())
+    # 3. 使用最新標準的 asyncio 機制在主執行緒中安全啟動 Bot
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(start_bot_async(application))
+    except Exception as e:
+        logging.error(f"❌ 啟動 Telegram 監聽時發生錯誤: {e}")
     
-    # 4. 主執行緒運行網頁服務
+    # 4. 主執行緒運行網頁服務，防止 Render 判定服務失效
     logging.info("🚀 雲端伺服器與監聽系統正式上線...")
     dummy_webhook_service()
