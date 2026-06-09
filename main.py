@@ -11,7 +11,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.background import BackgroundScheduler
 import shioaji as sj
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import matplotlib
 matplotlib.use('Agg')  # 強制非互動模式
 import matplotlib.pyplot as plt
@@ -74,30 +74,38 @@ def fetch_and_save_to_db():
         logging.error(f"❌ API 登入或連線失敗。錯誤訊息: {e}")
 
 def draw_chart_to_memory():
-    """ 從資料庫讀取今日數據，並直接把圖片畫在記憶體裡 """
-    # 這裡如果不加 try-except，拋出異常會直接卡死上層，因此這裡單純交給上層捕獲錯誤
+    """ 從資料庫讀取今日數據，並直接把圖片畫在記憶體裡（原生 SQL 安全版） """
     today_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
-    query = f"SELECT * FROM market_status WHERE timestamp LIKE '{today_str}%' ORDER BY timestamp ASC"
-    df = pd.read_sql(query, engine)
     
-    if df.empty:
+    # 關鍵修正：改用標準原生 SQL 語法查詢，彻底避開 pandas read_sql 的套件衝突 Bug
+    query = text("SELECT timestamp, tse_diff, otc_diff FROM market_status WHERE timestamp LIKE :today ORDER BY timestamp ASC")
+    
+    with engine.connect() as conn:
+        result = conn.execute(query, {"today": f"{today_str}%"})
+        # 將資料庫捞出來的結果轉成清單，再包裝成 DataFrame
+        rows = result.fetchall()
+        
+    if not rows:
         logging.warning(f"資料庫裡找不到當天 ({today_str}) 的數據")
         return False, None
         
+    # 手動建立 DataFrame 並指派欄位名稱
+    df = pd.DataFrame(rows, columns=['timestamp', 'tse_diff', 'otc_diff'])
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     
+    # 🎨 以下維持原有的 Matplotlib 記憶體繪圖邏輯 🎨
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
     plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
     plt.rcParams['axes.unicode_minus'] = False 
 
-    # 上市
+    # 上市圖表
     tse_colors = ['red' if val >= 0 else 'green' for val in df['tse_diff']]
     ax1.bar(df['timestamp'], df['tse_diff'], color=tse_colors, width=0.003)
     ax1.set_title("TWSE Market Width (TSE Diff)", fontsize=14)
     ax1.axhline(0, color='gray', linewidth=0.8, linestyle='--')
     ax1.grid(True, alpha=0.3)
 
-    # 上櫃
+    # 上櫃圖表
     otc_colors = ['red' if val >= 0 else 'green' for val in df['otc_diff']]
     ax2.bar(df['timestamp'], df['otc_diff'], color=otc_colors, width=0.003)
     ax2.set_title("TPEx Market Width (OTC Diff)", fontsize=14)
