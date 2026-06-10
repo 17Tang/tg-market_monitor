@@ -4,6 +4,7 @@ import logging
 import asyncio
 import traceback
 import pytz
+import threading  # 👈 核心修正：引入多線程套件，徹底防止網頁服務卡死排程器
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -38,20 +39,21 @@ IMAGE_PATH = "realtime_trend.png"
 # ==================================================================
 
 def fetch_and_save_to_db():
-    """ 盤中每 5 分鐘執行的排程任務：從永豐金正式環境抓取大盤快照 """
+    """ 【核心修正】24小時全自動定時排程：由內部精準判定台灣開盤時間，絕不受雲端主機時區干擾 """
     now = datetime.datetime.now(TW_TZ)
     
+    # 嚴格判定：如果是週末，或者不是台灣時間 09:00 ~ 13:35 之間，就跳過不抓
     if now.weekday() >= 5 or not ("09:00" <= now.strftime("%H:%M") <= "13:35"):
-        logging.info(f"非台股開盤時間 ({now.strftime('%H:%M')})，跳過抓取排程。")
+        logging.info(f"☕ 台灣時間 {now.strftime('%H:%M')} 非台股開盤時段，自動排程不執行抓取。")
         return
 
-    logging.info("⏰ 觸發定時任務：開始抓取盤中數據...")
+    logging.info(f"⏰ 【排程啟動】當前台灣時間 {now.strftime('%H:%M')}，開始對永豐金正式環境抓取大盤快照...")
     try:
-        # 關鍵修正：徹底移除 simulation=True，直接連線永豐金正式生產環境！
+        # 連線永豐金正式環境
         api = sj.Shioaji()
         api.login(api_key=API_KEY, secret_key=SECRET_KEY)
         
-        # 正式環境百分之百支援 001(上市) 與 101(上櫃) 大盤合約
+        # 抓取上市(001)與上櫃(101)即時數字
         snapshots = api.snapshots([api.Contracts.Stocks["001"], api.Contracts.Stocks["101"]])
         tse_diff = snapshots[0].up_count - snapshots[0].down_count
         otc_diff = snapshots[1].up_count - snapshots[1].down_count
@@ -63,10 +65,10 @@ def fetch_and_save_to_db():
         }
         df = pd.DataFrame(new_data)
         df.to_sql("market_status", engine, if_exists="append", index=False)
-        logging.info(f"📊 【正式數據】寫入成功 (TSE: {tse_diff:+d} | OTC: {otc_diff:+d})")
+        logging.info(f"📊 【全自動歸檔成功】TSE: {tse_diff:+d} | OTC: {otc_diff:+d}")
         api.logout()
     except Exception as e:
-        logging.error(f"❌ 永豐金正式環境連線或抓取失敗。錯誤訊息: {e}")
+        logging.error(f"❌ 永豐金 API 抓取失敗，原因: {e}")
 
 def draw_chart_to_memory():
     """ 從資料庫讀取今日數據，並直接把圖片畫在記憶體裡（原生 SQL 安全版） """
@@ -85,7 +87,6 @@ def draw_chart_to_memory():
     df = pd.DataFrame(rows, columns=['timestamp', 'tse_diff', 'otc_diff'])
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     
-    # 轉成純字典傳遞，避開 Pandas 歧義檢查
     latest_row_dict = df.iloc[-1].to_dict()
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
@@ -117,30 +118,24 @@ def draw_chart_to_memory():
     
     return latest_row_dict, img_buf
 
+# ==================== TELEGRAM 指令功能區 ====================
+
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """ 當收到 /check 指令時回應當前走勢圖 """
     try:
         await update.message.reply_text("⏳ 正在從雲端資料庫撈取最新真實數據並即時繪圖...")
         
         loop = asyncio.get_running_loop()
+        latest_data, img_buf = await loop.run_in_executor(None, draw_chart_to_memory)
         
-        def safe_draw():
-            try:
-                return draw_chart_to_memory()
-            except Exception as inner_err:
-                return "ERR_CRASH", traceback.format_exc()
-
-        result = await loop.run_in_executor(None, safe_draw)
-        
-        if isinstance(result, tuple) and result[0] == "ERR_CRASH":
-            error_details = result[1]
-            await update.message.reply_text(f"❌ 繪圖核心組件崩潰！詳細錯誤追蹤如下：\n```text\n{error_details}\n```", parse_mode="Markdown")
-            return
-
-        latest_data, img_buf = result
-        
+        # 【智慧防呆】如果發現今天剛好漏掉數據，手動按 /check 的當下立刻幫補抓一筆，不讓用戶看空圖
         if latest_data is None:
-            await update.message.reply_text("❌ 資料庫中目前還沒有今天的數據喔！請靜待下一個 5 分鐘自動排程寫入真實數據。")
+            logging.info("發現今日資料庫無數據，立刻在點擊當下強制觸發即時抓取...")
+            await loop.run_in_executor(None, fetch_and_save_to_db)
+            latest_data, img_buf = await loop.run_in_executor(None, draw_chart_to_memory)
+
+        if latest_data is None:
+            await update.message.reply_text("❌ 【憑證權限提示】已強制觸發連線，但仍無法寫入數據。請確認您的永豐金 API「正式環境」憑證是否已成功開通並在線。")
         else:
             time_str = pd.to_datetime(latest_data['timestamp']).strftime('%H:%M')
             caption_text = (
@@ -151,8 +146,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await update.message.reply_photo(photo=img_buf, caption=caption_text)
             
     except Exception as e:
-        ext_err = traceback.format_exc()
-        await update.message.reply_text(f"❌ 指令執行失敗：\n```text\n{ext_err}\n```", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ 指令執行失敗，詳細原因: {e}")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """ /history 指令：直接在 TG 查閱最新 10 筆數據進行核對 """
@@ -163,7 +157,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             rows = result.fetchall()
             
         if not rows:
-            await update.message.reply_text("📭 目前資料庫內沒有任何數據。")
+            await update.message.reply_text("📭 目前資料庫內沒有任何數據喔！")
             return
             
         report = "📋 【資料庫最新 10 筆數據核對】\n時間 | 上市差 | 上櫃差\n---------------------\n"
@@ -188,7 +182,7 @@ async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ 資料庫清理失敗: {e}")
 
 def dummy_webhook_service():
-    """ 網頁服務核心，用來維持 Render 存活 """
+    """ 網頁服務核心：用來維持 Render 存活不中斷 """
     from http.server import BaseHTTPRequestHandler, HTTPServer
     class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -199,29 +193,24 @@ def dummy_webhook_service():
     server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
     server.serve_forever()
 
-async def main():
-    # 1. 啟動背景排程器
+if __name__ == '__main__':
+    # 1. 【核心修正】啟動獨立背景定時排程器（每 5 分鐘固定觸發，不再受 Render 時區限制影響）
     scheduler = BackgroundScheduler()
-    scheduler.add_job(fetch_and_save_to_db, 'cron', minute='*/5')
+    scheduler.add_job(fetch_and_save_to_db, 'interval', minutes=5)
     scheduler.start()
-    logging.info("⏰ 盤中定時排程器已啟動...")
+    logging.info("⏰ 背景定時自動排程系統已就位...")
     
-    # 2. 設定 Telegram Bot
+    # 2. 設定 Telegram Bot 指令
     application = Application.builder().token(TG_TOKEN).build()
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("clean", clean_command))
     
-    # 3. 啟動 Telegram Bot 監聽
-    await application.initialize()
-    await application.updater.start_polling()
-    await application.start()
-    logging.info("🤖 Telegram Bot 監聽服務已在背景建立...")
+    # 3. 【核心修正】使用背景 Thread 執行網頁存活服務，將主執行緒完全解放給 Bot，排程絕不卡死
+    web_thread = threading.Thread(target=dummy_webhook_service, daemon=True)
+    web_thread.start()
+    logging.info("🌐 網頁存活守護守護服務已順利推至背景獨立執行緒...")
     
-    # 4. 執行網頁服務
-    logging.info("🚀 雲端伺服器與監聽系統正式上線...")
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, dummy_webhook_service)
-
-if __name__ == '__main__':
-    asyncio.run(main())
+    # 4. 啟動 Telegram Bot 服務並讓主執行緒維持監聽
+    logging.info("🚀 雲端自動排程數據監聽系統正式上線...")
+    application.run_polling()
